@@ -1,10 +1,11 @@
-// shared/src/commonMain/kotlin/App.kt
-package com.vessapp
+package br.edu.utfpr.vessapp.presentation
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.* // Importa tudo do Material Design 3
+import androidx.compose.material3.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -16,17 +17,19 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.datetime.Clock
+import kotlinx.datetime.Instant
+import kotlinx.datetime.TimeZone
+import kotlinx.datetime.toLocalDateTime
+import kotlinx.datetime.toInstant
 
-// --- Data Models (Shared) ---
-// Representa a configuração do usuário
-data class Config(
-    val name: String = "",
-    val email: String = "",
-    val country: String = "",
-    val address: String = "",
-    val cityState: String = "",
-    val language: String = "Português (Brasil)"
-)
+import br.edu.utfpr.vessapp.domain.entity.Config
+import br.edu.utfpr.vessapp.domain.useCase.GetConfigUseCase
+import br.edu.utfpr.vessapp.domain.useCase.SaveConfigUseCase
+import br.edu.utfpr.vessapp.data.repository.ConfigRepositoryImpl
+import br.edu.utfpr.vessapp.presentation.configurations.ConfigurationsScreen
+import br.edu.utfpr.vessapp.presentation.configurations.ConfigurationsViewModel
+import br.edu.utfpr.vessapp.util.PlatformContext
+import br.edu.utfpr.vessapp.util.getPlatformContext
 
 // Representa os dados de uma camada de solo
 data class LayerEvaluation(
@@ -55,9 +58,7 @@ data class EvaluationSession(
     var endTime: Long? = null // Nullable para avaliação em andamento
 )
 
-
-// --- Shared State Management (Simplificado) ---
-// Define as telas que o aplicativo pode ter. Apenas o MENU é usado inicialmente.
+// --- Shared State Management (Centralizado no AppViewModel principal) ---
 enum class Screen {
     MENU,
     CONFIGURATIONS,
@@ -68,35 +69,68 @@ enum class Screen {
     HISTORY
 }
 
-// ViewModel simplificado para gerenciar o estado da aplicação
-class AppViewModel {
-    // Estado da tela atual, começa no MENU
+// ViewModel principal para gerenciar a navegação e estados globais
+class AppViewModel(
+    val configurationsViewModel: ConfigurationsViewModel // Injetando o ViewModel de configurações
+) {
     private val _currentScreen = MutableStateFlow(Screen.MENU)
     val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
 
-    // Estado da configuração (simulado, apenas para o avaliador no menu)
-    private val _currentConfig = MutableStateFlow(Config(name = "Avaliador Padrão"))
-    val currentConfig: StateFlow<Config> = _currentConfig.asStateFlow()
+    // O AppViewModel não gerencia mais diretamente a Config, ele delega ao ConfigurationsViewModel
+    // private val _currentConfig = MutableStateFlow(Config())
+    // val currentConfig: StateFlow<Config> = _currentConfig.asStateFlow()
 
-    // Navega para uma nova tela
+    // O AppViewModel pode observar o configState do ConfigurationsViewModel se precisar
+    // de acesso a ele para alguma lógica global
+    val currentConfig: StateFlow<Config> = configurationsViewModel.configState
+
+    // Métodos de navegação
     fun navigateTo(screen: Screen) {
         _currentScreen.value = screen
     }
 
-    // Funções placeholder para a tela de Configurações, para evitar erros de referência no menu
-    fun updateConfig(newConfig: Config) {
-        _currentConfig.value = newConfig
+    // Funções placeholder para as telas de Avaliação (ainda não implementadas com ViewModels dedicados)
+    private val _currentEvaluationSession = MutableStateFlow<EvaluationSession?>(null)
+    val currentEvaluationSession: StateFlow<EvaluationSession?> = _currentEvaluationSession.asStateFlow()
+
+    private val _currentSample = MutableStateFlow<Sample?>(null)
+    val currentSample: StateFlow<Sample?> = _currentSample.asStateFlow()
+
+    private val _completedEvaluationSessions = MutableStateFlow<List<EvaluationSession>>(emptyList())
+    val completedEvaluationSessions: StateFlow<List<EvaluationSession>> = _completedEvaluationSessions.asStateFlow()
+
+    fun startNewEvaluationSession(description: String) {
+        val sessionId = "eval-${Clock.System.now().toEpochMilliseconds()}"
+        _currentEvaluationSession.value = EvaluationSession(id = sessionId, description = description)
+        navigateTo(Screen.EVALUATION_SAMPLE)
     }
 
-    // Funções placeholder para as telas de Avaliação
-    fun startNewEvaluationSession(description: String) {}
-    fun addSampleToCurrentEvaluation(sample: Sample) {}
-    fun completeCurrentEvaluationSession() {}
-    fun clearCurrentSample() {}
-    fun setCurrentSample(sample: Sample) {}
+    fun addSampleToCurrentEvaluation(sample: Sample) {
+        _currentEvaluationSession.value?.let { session ->
+            val updatedSamples = session.samples + sample
+            _currentEvaluationSession.value = session.copy(samples = updatedSamples)
+        }
+        _currentSample.value = sample
+    }
+
+    fun completeCurrentEvaluationSession() {
+        _currentEvaluationSession.value?.let { session ->
+            val completedSession = session.copy(endTime = Clock.System.now().toEpochMilliseconds())
+            _completedEvaluationSessions.value = _completedEvaluationSessions.value + completedSession
+            _currentEvaluationSession.value = null
+            _currentSample.value = null
+        }
+    }
+
+    fun clearCurrentSample() {
+        _currentSample.value = null
+    }
+
+    fun setCurrentSample(sample: Sample) {
+        _currentSample.value = sample
+    }
 }
 
-// CompositionLocal para fornecer o ViewModel para os composables filhos
 val LocalAppViewModel = staticCompositionLocalOf<AppViewModel> {
     error("No AppViewModel provided")
 }
@@ -105,26 +139,78 @@ val LocalAppViewModel = staticCompositionLocalOf<AppViewModel> {
 
 @Composable
 fun App() {
-    // Cria e lembra uma instância do ViewModel para o ciclo de vida do App
-    val viewModel = remember { AppViewModel() }
-    // Observa o estado da tela atual do ViewModel
-    val currentScreen by viewModel.currentScreen.collectAsState()
+    val platformContext = getPlatformContext()
 
-    // Aplica o tema Material Design 3
+    val configLocalDataSource = remember {
+        when (platformContext) {
+            is PlatformContext -> {
+                // Supondo que AndroidPlatformContext tem 'androidContext'
+                // e IosPlatformContext não precisa de parâmetro para o construtor
+                try {
+                    // Tenta criar para Android (se o cast for seguro e a classe exista)
+                    val androidContextField = platformContext::class.members.find { it.name == "androidContext" }
+                    if (androidContextField != null) {
+                        val androidContext = androidContextField.call(platformContext) as android.content.Context
+                        br.edu.utfpr.vessapp.data.local.ConfigLocalDataSource(androidContext)
+                    } else {
+                        // Se não for Android, tentar criar para iOS (ou outro, se houver)
+                        br.edu.utfpr.vessapp.data.local.ConfigLocalDataSource()
+                    }
+                } catch (e: Exception) {
+                    println("Erro ao instanciar ConfigLocalDataSource: ${e.message}")
+                    // Fallback para iOS se o Android falhar ou for iOS
+                    br.edu.utfpr.vessapp.data.local.ConfigLocalDataSource()
+                }
+            }
+            else -> error("Tipo de PlatformContext desconhecido")
+        }
+    }
+
+
+    // 3. Criar a implementação do repositório de configuração
+    val configRepository = remember {
+        ConfigRepositoryImpl(configLocalDataSource)
+    }
+
+    // 4. Criar os casos de uso de configuração
+    val getConfigUseCase = remember {
+        GetConfigUseCase(configRepository)
+    }
+    val saveConfigUseCase = remember {
+        SaveConfigUseCase(configRepository)
+    }
+
+    // 5. Criar o ViewModel de configurações, injetando os casos de uso
+    val configurationsViewModel = remember {
+        ConfigurationsViewModel(getConfigUseCase, saveConfigUseCase)
+    }
+
+    // 6. Criar o AppViewModel principal, injetando o ConfigurationsViewModel
+    val appViewModel = remember {
+        AppViewModel(configurationsViewModel)
+    }
+
+    val currentScreen by appViewModel.currentScreen.collectAsState()
+
     MaterialTheme(
-        colorScheme = LightColorScheme, // Esquema de cores personalizado
-        typography = Typography // Tipografia personalizada
+        colorScheme = LightColorScheme,
+        typography = Typography
     ) {
-        // Superfície de fundo que preenche a tela inteira
         Surface(modifier = Modifier.fillMaxSize()) {
-            // Fornece o ViewModel para todos os composables abaixo nesta hierarquia
-            CompositionLocalProvider(LocalAppViewModel provides viewModel) {
-                // Exibe a tela correspondente ao estado atual
+            CompositionLocalProvider(LocalAppViewModel provides appViewModel) {
                 when (currentScreen) {
                     Screen.MENU -> MainMenuScreen()
-                    // Outras telas não serão alcançadas com esta configuração inicial,
-                    // mas mantidas no enum para futura expansão
-                    else -> Text(text = "Tela em construção: ${currentScreen.name}") // Placeholder para telas não implementadas
+                    Screen.CONFIGURATIONS -> ConfigurationsScreen(
+                        configurationsViewModel = configurationsViewModel,
+                        appViewModel = appViewModel
+                    )
+                    // As outras telas ainda usam a implementação do AppViewModel original.
+                    // Em um futuro, elas também terão seus próprios ViewModels injetados.
+                    Screen.NEW_EVALUATION_DESCRIPTION -> NewEvaluationDescriptionScreen()
+                    Screen.EVALUATION_SAMPLE -> EvaluationSampleScreen()
+                    Screen.EVALUATION_RESULT -> EvaluationResultScreen()
+                    Screen.FINAL_SUMMARY -> FinalSummaryScreen()
+                    Screen.HISTORY -> HistoryScreen()
                 }
             }
         }
@@ -133,32 +219,27 @@ fun App() {
 
 @Composable
 fun MainMenuScreen() {
-    // Obtém a instância do ViewModel fornecida pelo CompositionLocalProvider
     val viewModel = LocalAppViewModel.current
     Column(
         modifier = Modifier
-            .fillMaxSize() // Preenche toda a área disponível
-            .background(LightColorScheme.background) // Cor de fundo do tema
-            .padding(16.dp), // Preenchimento interno
-        horizontalAlignment = Alignment.CenterHorizontally, // Centraliza o conteúdo horizontalmente
-        verticalArrangement = Arrangement.Center // Centraliza o conteúdo verticalmente
+            .fillMaxSize()
+            .background(LightColorScheme.background)
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
-        // Título principal do aplicativo
         Text(
             text = "VESS",
             fontSize = 32.sp,
             fontWeight = FontWeight.Bold,
-            color = LightColorScheme.primary, // Cor de texto marrom escura do tema
-            modifier = Modifier.padding(bottom = 32.dp) // Espaçamento abaixo do título
+            color = LightColorScheme.primary,
+            modifier = Modifier.padding(bottom = 32.dp)
         )
 
-        // Botões do menu, cada um com sua ação de navegação
         MenuButton(text = "AVALIAR") {
-            // No momento, apenas navega para NEW_EVALUATION_DESCRIPTION.
-            // Esta tela será implementada no próximo passo.
             viewModel.navigateTo(Screen.NEW_EVALUATION_DESCRIPTION)
         }
-        Spacer(Modifier.height(16.dp)) // Espaçador entre o primeiro e os demais botões
+        Spacer(Modifier.height(16.dp))
         MenuButton(text = "Processo de avaliação") { /* TODO: Navegar para tutorial */ }
         Spacer(Modifier.height(8.dp))
         MenuButton(text = "Equipamentos") { /* TODO: Navegar para tutorial */ }
@@ -181,11 +262,11 @@ fun MainMenuScreen() {
         Spacer(Modifier.height(8.dp))
         MenuButton(text = "O que é o VESS") { /* TODO: Navegar para tutorial */ }
         Spacer(Modifier.height(8.dp))
-        MenuButton(text = "Minhas avaliações") { viewModel.navigateTo(Screen.HISTORY) } // Navega para o histórico (ainda não implementado)
+        MenuButton(text = "Minhas avaliações") { viewModel.navigateTo(Screen.HISTORY) }
         Spacer(Modifier.height(8.dp))
         MenuButton(text = "Sobre o App") { /* TODO: Navegar para tela "Sobre" */ }
         Spacer(Modifier.height(8.dp))
-        MenuButton(text = "Configurações") { viewModel.navigateTo(Screen.CONFIGURATIONS) } // Navega para configurações (ainda não implementado)
+        MenuButton(text = "Configurações") { viewModel.navigateTo(Screen.CONFIGURATIONS) }
     }
 }
 
@@ -194,40 +275,701 @@ fun MenuButton(text: String, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         modifier = Modifier
-            .fillMaxWidth() // Preenche a largura disponível
-            .height(56.dp) // Altura fixa
-            .padding(horizontal = 16.dp), // Preenchimento horizontal
-        colors = ButtonDefaults.buttonColors(containerColor = LightColorScheme.secondary), // Cor de fundo do botão do tema
-        shape = RoundedCornerShape(12.dp) // Cantos arredondados
+            .fillMaxWidth()
+            .height(56.dp)
+            .padding(horizontal = 16.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = LightColorScheme.secondary),
+        shape = RoundedCornerShape(12.dp)
     ) {
         Text(text = text, color = LightColorScheme.onSecondary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
+// O ConfigInputField foi movido para ConfigurationsScreen.kt, mas está aqui para referência
+// para o caso de ainda ser necessário no App.kt para outros composables.
+// Se já estiver em ConfigurationsScreen.kt e não for usado em outro lugar, pode remover daqui.
+@Composable
+fun ConfigInputField(label: String, value: String, onValueChange: (String) -> Unit, enabled: Boolean = true, isMultiLine: Boolean = false, trailingIcon: @Composable (() -> Unit)? = null) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        Text(text = label, fontSize = 16.sp, color = LightColorScheme.primary, modifier = Modifier.padding(bottom = 4.dp))
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.fillMaxWidth(),
+            colors = TextFieldDefaults.colors(
+                focusedBorderColor = LightColorScheme.primary,
+                unfocusedBorderColor = LightColorScheme.secondary,
+                cursorColor = LightColorScheme.primary,
+                focusedLabelColor = LightColorScheme.primary,
+                unfocusedLabelColor = LightColorScheme.secondary
+            ),
+            shape = RoundedCornerShape(8.dp),
+            enabled = enabled,
+            trailingIcon = trailingIcon,
+            singleLine = !isMultiLine
+        )
+    }
+}
+
+// Placeholder para outras telas que serão refatoradas posteriormente
+@Composable
+fun NewEvaluationDescriptionScreen() {
+    val viewModel = LocalAppViewModel.current
+    val currentConfig by viewModel.currentConfig.collectAsState()
+
+    val now = Clock.System.now().toLocalDateTime(TimeZone.currentSystemDefault())
+    val initialDescription = "Avaliação ${now.date} - ${now.time.hour.toString().padStart(2, '0')}:${now.time.minute.toString().padStart(2, '0')}"
+    var evaluationDescription by remember { mutableStateOf(initialDescription) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(LightColorScheme.background)
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "Iniciar Nova Avaliação",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.padding(bottom = 24.dp)
+        )
+
+        ConfigInputField(label = "Avaliador:", value = currentConfig.name, onValueChange = { /* Não editável aqui */ }, enabled = false)
+        Spacer(Modifier.height(16.dp))
+        ConfigInputField(label = "Descrição da Avaliação:", value = evaluationDescription, onValueChange = { evaluationDescription = it })
+
+        Spacer(Modifier.height(24.dp))
+
+        Button(
+            onClick = {
+                viewModel.startNewEvaluationSession(evaluationDescription)
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = LightColorScheme.primary),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Text(text = "Iniciar Avaliação", color = LightColorScheme.onPrimary, fontSize = 18.sp)
+        }
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick = { viewModel.navigateTo(Screen.MENU) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color.LightGray),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Text(text = "Cancelar", color = Color.DarkGray, fontSize = 18.sp)
+        }
+    }
+}
+
+
+@Composable
+fun EvaluationSampleScreen() {
+    val viewModel = LocalAppViewModel.current
+    val currentConfig by viewModel.currentConfig.collectAsState() // Obter a configuração para o avaliador
+    val currentEvaluationSession by viewModel.currentEvaluationSession.collectAsState()
+    val currentSample by viewModel.currentSample.collectAsState()
+
+    val sampleInitialCount = remember(currentEvaluationSession) { currentEvaluationSession?.samples?.size?.plus(1) ?: 1 }
+    val sampleId = remember(currentEvaluationSession) { "amostra-${Clock.System.now().toEpochMilliseconds()}" }
+    var sampleName by remember(currentSample) { mutableStateOf(currentSample?.name ?: "Amostra № $sampleInitialCount") }
+    var numLayers by remember(currentSample) { mutableStateOf(currentSample?.numLayers?.toString() ?: "1") }
+    var location by remember(currentSample) { mutableStateOf(currentSample?.location ?: "") }
+    var otherInfo by remember(currentSample) { mutableStateOf(currentSample?.otherInfo ?: "") }
+
+    val layersState = remember(currentSample) {
+        mutableStateListOf<MutableState<LayerEvaluation>>().apply {
+            currentSample?.layers?.forEach { add(mutableStateOf(it)) }
+            if (isEmpty() && numLayers.toIntOrNull() ?: 1 > 0) {
+                repeat(numLayers.toIntOrNull() ?: 1) {
+                    add(mutableStateOf(LayerEvaluation()))
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(numLayers) {
+        val targetLayers = numLayers.toIntOrNull() ?: 1
+        if (targetLayers > layersState.size) {
+            repeat(targetLayers - layersState.size) {
+                layersState.add(mutableStateOf(LayerEvaluation()))
+            }
+        } else if (targetLayers < layersState.size) {
+            while (layersState.size > targetLayers && layersState.size > 0) {
+                layersState.removeAt(layersState.lastIndex)
+            }
+        }
+    }
+
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(LightColorScheme.background)
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        item {
+            Text(
+                text = "Avaliações",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold,
+                color = LightColorScheme.primary,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "Amostra № ${currentEvaluationSession?.samples?.size?.plus(1) ?: 1}",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = LightColorScheme.primary
+                )
+                Button(
+                    onClick = { /* Lógica para editar nome da amostra */ },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent, contentColor = Color(0xFF4285F4)),
+                    elevation = null
+                ) {
+                    Text(text = "Editar")
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            ConfigInputField(label = "Nome da Amostra:", value = sampleName, onValueChange = { sampleName = it })
+
+            Text(
+                text = "Quantas camadas de solo deseja avaliar?",
+                fontSize = 16.sp,
+                color = LightColorScheme.primary,
+                modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceAround
+            ) {
+                (1..5).forEach { number ->
+                    NumberPickerButton(
+                        number = number,
+                        isSelected = numLayers.toIntOrNull() == number,
+                        onClick = { numLayers = number.toString() }
+                    )
+                }
+            }
+
+            ConfigInputField(
+                label = "Local/propriedade (GPS):",
+                value = location,
+                onValueChange = { location = it },
+                trailingIcon = {
+                    Icon(Icons.Filled.Info, "Obter localização GPS", modifier = Modifier.clickable {
+                        location = "Localização obtida via GPS (simulado)"
+                    })
+                }
+            )
+
+            ConfigInputField(label = "Avaliador:", value = currentConfig.name, onValueChange = { /* Não editável aqui */ }, enabled = false)
+
+            Spacer(Modifier.height(16.dp))
+
+            layersState.forEachIndexed { index, layerState ->
+                val layer = layerState.value
+                Text(
+                    text = "Camada ${index + 1}:",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = LightColorScheme.primary,
+                    modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                )
+                ConfigInputField(
+                    label = "Comprimento camada ${index + 1}:",
+                    value = layer.length,
+                    onValueChange = { layerState.value = layer.copy(length = it) }
+                )
+                ConfigInputField(
+                    label = "Nota camada ${index + 1}:",
+                    value = layer.score,
+                    onValueChange = { layerState.value = layer.copy(score = it) }
+                )
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Button(
+                onClick = { /* TODO: Implementar upload de arquivo */ },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+                    .padding(horizontal = 16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = LightColorScheme.secondary),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(text = "Upload de Arquivo", color = LightColorScheme.onSecondary, fontSize = 18.sp)
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            ConfigInputField(
+                label = "Outras informações importantes:",
+                value = otherInfo,
+                onValueChange = { otherInfo = it },
+                isMultiLine = true,
+                trailingIcon = {
+                    Icon(Icons.Filled.Info, "Sugestões", modifier = Modifier.clickable {
+                    })
+                }
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            Button(
+                onClick = {
+                    val newSample = Sample(
+                        id = sampleId,
+                        name = sampleName,
+                        numLayers = numLayers.toIntOrNull() ?: 1,
+                        location = location,
+                        evaluator = currentConfig.name,
+                        layers = layersState.map { it.value },
+                        otherInfo = otherInfo
+                    )
+                    viewModel.addSampleToCurrentEvaluation(newSample)
+                    viewModel.navigateTo(Screen.EVALUATION_RESULT)
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = LightColorScheme.primary),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(text = "Avaliar", color = LightColorScheme.onPrimary, fontSize = 18.sp)
+            }
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = {
+                    viewModel.clearCurrentSample()
+                    viewModel.navigateTo(Screen.MENU)
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color.LightGray),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(text = "Cancelar Avaliação da Amostra", color = Color.DarkGray, fontSize = 18.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun NumberPickerButton(number: Int, isSelected: Boolean, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier
+            .size(48.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (isSelected) LightColorScheme.primary else LightColorScheme.secondary
+        ),
+        shape = RoundedCornerShape(50)
+    ) {
+        Text(text = number.toString(), color = LightColorScheme.onPrimary, fontSize = 18.sp)
+    }
+}
+
+@Composable
+fun EvaluationResultScreen() {
+    val viewModel = LocalAppViewModel.current
+    val currentSample by viewModel.currentSample.collectAsState()
+
+    val sampleScore = remember(currentSample) {
+        currentSample?.let { sample ->
+            if (sample.layers.isNotEmpty()) {
+                val sumScores = sample.layers.sumOf { it.score.toDoubleOrNull() ?: 0.0 }
+                val avgScore = sumScores / sample.layers.size
+                String.format("%.1f", avgScore)
+            } else "N/A"
+        } ?: "N/A"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(LightColorScheme.background)
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Top
+    ) {
+        Text(
+            text = "Avaliações",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.padding(bottom = 16.dp)
+        )
+
+        Text(
+            text = "Escore Qe-VESS da amostra ${currentSample?.name ?: "X"}:",
+            fontSize = 20.sp,
+            color = LightColorScheme.primary,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        Card(
+            modifier = Modifier
+                .width(150.dp)
+                .height(80.dp),
+            colors = CardDefaults.cardColors(containerColor = LightColorScheme.secondary),
+            shape = RoundedCornerShape(16.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                Text(text = sampleScore, fontSize = 48.sp, fontWeight = FontWeight.Bold, color = LightColorScheme.onSecondary)
+            }
+        }
+        Text(
+            text = "Ball et al. (2017)",
+            fontSize = 12.sp,
+            color = Color.Gray,
+            modifier = Modifier.padding(top = 4.dp, bottom = 24.dp)
+        )
+
+        Text(
+            text = "Decisão de manejo:",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+        )
+        val decisionText = when (sampleScore.toDoubleOrNull() ?: 5.0) {
+            in 1.0..2.9 -> "Solo com boa qualidade estrutural e não requer mudanças no manejo."
+            in 3.0..3.9 -> "Solo com qualidade estrutural razoável que pode ser melhorado. Considere rotação de culturas e outras práticas."
+            in 4.0..5.0 -> "Danos às funções do solo, comprometendo sua capacidade de suporte. Intervenção direta é geralmente necessária."
+            else -> "Avaliação inválida."
+        }
+        Text(
+            text = decisionText,
+            fontSize = 16.sp,
+            color = LightColorScheme.onBackground,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+        )
+
+        Text(
+            text = "Resumo da avaliação:",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+        )
+        currentSample?.let { sample ->
+            sample.layers.forEachIndexed { index, layer ->
+                Text(
+                    text = "Comprimento camada ${index + 1}: ${layer.length} cm; nota ${index + 1}: ${layer.score}",
+                    fontSize = 16.sp,
+                    color = LightColorScheme.onBackground,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+                )
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = "Outras informações importantes:",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+        )
+        Text(
+            text = currentSample?.otherInfo ?: "N/A",
+            fontSize = 16.sp,
+            color = LightColorScheme.onBackground,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp)
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            Button(
+                onClick = {
+                    viewModel.completeCurrentEvaluationSession()
+                    viewModel.navigateTo(Screen.FINAL_SUMMARY)
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(56.dp)
+                    .padding(end = 8.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = LightColorScheme.primary),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(text = "FINALIZAR", color = LightColorScheme.onPrimary, fontSize = 16.sp)
+            }
+            Button(
+                onClick = {
+                    viewModel.clearCurrentSample()
+                    viewModel.navigateTo(Screen.EVALUATION_SAMPLE)
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(56.dp)
+                    .padding(start = 8.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = LightColorScheme.secondary),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(text = "PRÓXIMA AMOSTRA", color = LightColorScheme.onSecondary, fontSize = 16.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun FinalSummaryScreen() {
+    val viewModel = LocalAppViewModel.current
+    val completedSessions by viewModel.completedEvaluationSessions.collectAsState()
+    val lastSession = completedSessions.lastOrNull()
+
+    val averageScore = remember(lastSession) {
+        lastSession?.samples?.let { samples ->
+            if (samples.isNotEmpty()) {
+                val totalScores = samples.sumOf { sample ->
+                    sample.layers.sumOf { it.score.toDoubleOrNull() ?: 0.0 }
+                }
+                val totalLayers = samples.sumOf { it.layers.size }
+                if (totalLayers > 0) {
+                    String.format("%.1f", totalScores / totalLayers)
+                } else "N/A"
+            } else "N/A"
+        } ?: "N/A"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(LightColorScheme.background)
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Top
+    ) {
+        Text(
+            text = "Avaliações",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.padding(bottom = 16.dp)
+        )
+
+        Text(
+            text = "Escore Qe-VESS médio do local X:",
+            fontSize = 20.sp,
+            color = LightColorScheme.primary,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        Card(
+            modifier = Modifier
+                .width(150.dp)
+                .height(80.dp),
+            colors = CardDefaults.cardColors(containerColor = LightColorScheme.secondary),
+            shape = RoundedCornerShape(16.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                Text(text = averageScore, fontSize = 48.sp, fontWeight = FontWeight.Bold, color = LightColorScheme.onSecondary)
+            }
+        }
+        Text(
+            text = "Ball et al. (2017)",
+            fontSize = 12.sp,
+            color = Color.Gray,
+            modifier = Modifier.padding(top = 4.dp, bottom = 24.dp)
+        )
+
+        Text(
+            text = "Decisão de manejo para o local:",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+        )
+        val localManejoDecision = when (averageScore.toDoubleOrNull() ?: 5.0) {
+            in 1.0..2.9 -> "Solo com boa qualidade estrutural para o local e não requer mudanças no manejo."
+            in 3.0..3.9 -> "Solo com qualidade estrutural razoável para o local que pode ser melhorado. Considere rotação de culturas e outras práticas."
+            in 4.0..5.0 -> "Danos às funções do solo no local, comprometendo sua capacidade de suporte. Intervenção direta é geralmente necessária."
+            else -> "Avaliação média inválida."
+        }
+        Text(
+            text = localManejoDecision,
+            fontSize = 16.sp,
+            color = LightColorScheme.onBackground,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+        )
+
+        Text(
+            text = "Resumo da avaliação:",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+        )
+
+        lastSession?.let { session ->
+            val totalSamples = session.samples.size
+            val startTime = Instant.fromEpochMilliseconds(session.startTime).toLocalDateTime(TimeZone.currentSystemDefault())
+            val endTime = session.endTime?.let { Instant.fromEpochMilliseconds(it).toLocalDateTime(TimeZone.currentSystemDefault()) }
+
+            Text(text = "$totalSamples amostras", fontSize = 16.sp, color = LightColorScheme.onBackground)
+            Text(text = "Avaliador: ${viewModel.currentConfig.value.name}", fontSize = 16.sp, color = LightColorScheme.onBackground)
+            Text(text = "Data da avaliação: ${startTime.date}", fontSize = 16.sp, color = LightColorScheme.onBackground)
+            Text(text = "Hora de início: ${startTime.time.hour.toString().padStart(2, '0')}:${startTime.time.minute.toString().padStart(2, '0')}", fontSize = 16.sp, color = LightColorScheme.onBackground)
+            if (endTime != null) {
+                Text(text = "Hora de término: ${endTime.time.hour.toString().padStart(2, '0')}:${endTime.time.minute.toString().padStart(2, '0')}", fontSize = 16.sp, color = LightColorScheme.onBackground)
+
+                val startInstant = Instant.fromEpochMilliseconds(session.startTime)
+                val endInstant = endTime.toInstant(TimeZone.currentSystemDefault())
+                val durationMillis = endInstant - startInstant
+                val minutes = durationMillis.inWholeMinutes
+
+                Text(text = "Tempo de avaliação: $minutes minutos", fontSize = 16.sp, color = LightColorScheme.onBackground)
+            }
+        } ?: Text(text = "Nenhuma sessão de avaliação finalizada recentemente.", fontSize = 16.sp, color = Color.Gray)
+
+
+        Spacer(Modifier.height(24.dp))
+
+        Button(
+            onClick = {
+                // TODO: Salvar a sessão de avaliação no Firestore/Storage
+                viewModel.navigateTo(Screen.HISTORY)
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = LightColorScheme.primary),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Text(text = "Salvar e Finalizar", color = LightColorScheme.onPrimary, fontSize = 18.sp)
+        }
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick = { viewModel.navigateTo(Screen.MENU) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color.LightGray),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Text(text = "Voltar ao Menu Principal", color = Color.DarkGray, fontSize = 18.sp)
+        }
+    }
+}
+
+@Composable
+fun HistoryScreen() {
+    val viewModel = LocalAppViewModel.current
+    val completedSessions by viewModel.completedEvaluationSessions.collectAsState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(LightColorScheme.background)
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "Histórico de Avaliações",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = LightColorScheme.primary,
+            modifier = Modifier.padding(bottom = 24.dp)
+        )
+
+        if (completedSessions.isEmpty()) {
+            Text(text = "Nenhuma avaliação realizada ainda.", color = Color.Gray)
+        } else {
+            LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                items(completedSessions) { session ->
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp)
+                            .clickable { /* TODO: Implementar visualização detalhada da avaliação */ },
+                        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = LightColorScheme.surface)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = session.description,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = LightColorScheme.primary
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = "Amostras: ${session.samples.size}",
+                                fontSize = 14.sp,
+                                color = Color.Gray
+                            )
+                            val startTime = Instant.fromEpochMilliseconds(session.startTime).toLocalDateTime(TimeZone.currentSystemDefault())
+                            Text(
+                                text = "Início: ${startTime.date}",
+                                fontSize = 14.sp,
+                                color = Color.Gray
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+        Button(
+            onClick = { viewModel.navigateTo(Screen.MENU) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color.LightGray),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Text(text = "Voltar ao Menu", color = Color.DarkGray, fontSize = 18.sp)
+        }
+    }
+}
+
 // --- Theme & Typography (Material 3) ---
-// Define o esquema de cores claras para o tema Material 3
 private val LightColorScheme = lightColorScheme(
-    primary = Color(0xFF6B4423), // Marrom escuro para elementos primários
-    onPrimary = Color.White, // Cor do texto sobre a cor primária
-    primaryContainer = Color(0xFFC7A88B), // Container primário, pode ser usado para botões, cards
-    onPrimaryContainer = Color.Black, // Cor do texto sobre o container primário
-    secondary = Color(0xFFC7A88B), // Marrom claro para elementos secundários (botões de menu)
-    onSecondary = Color.White, // Cor do texto sobre a cor secundária
-    secondaryContainer = Color(0xFFA0846C), // Container secundário
-    onSecondaryContainer = Color.White, // Cor do texto sobre o container secundário
-    tertiary = Color(0xFF4285F4), // Cor terciária (ex: Azul do Google para "Editar")
-    onTertiary = Color.White, // Cor do texto sobre a cor terciária
-    background = Color(0xFFEFE9DC), // Fundo bege claro da tela
-    onBackground = Color.Black, // Cor do texto sobre o fundo
-    surface = Color.White, // Cor de superfície (ex: para Cards)
-    onSurface = Color.Black, // Cor do texto sobre a superfície
-    error = Color(0xFFB00020), // Cor de erro
-    onError = Color.White, // Cor do texto sobre erro
-    outline = Color(0xFF6B4423) // Cor para contornos de campos de texto, etc.
+    primary = Color(0xFF6B4423),
+    onPrimary = Color.White,
+    primaryContainer = Color(0xFFC7A88B),
+    onPrimaryContainer = Color.Black,
+    secondary = Color(0xFFC7A88B),
+    onSecondary = Color.White,
+    secondaryContainer = Color(0xFFA0846C),
+    onSecondaryContainer = Color.White,
+    tertiary = Color(0xFF4285F4),
+    onTertiary = Color.White,
+    background = Color(0xFFEFE9DC),
+    onBackground = Color.Black,
+    surface = Color.White,
+    onSurface = Color.Black,
+    error = Color(0xFFB00020),
+    onError = Color.White,
+    outline = Color(0xFF6B4423)
 )
 
-// Define a tipografia para o tema Material 3
-private val Typography = androidx.compose.material3.Typography(
-    // Por enquanto, uma tipografia vazia usando os valores padrão do Material 3.
-    // Você pode personalizá-la aqui no futuro.
+private val Typography = Typography(
+    // Defina seus estilos de texto aqui
 )

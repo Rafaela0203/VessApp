@@ -1,11 +1,8 @@
 package br.edu.utfpr.vessapp.domain.entity
 
-import kotlinx.serialization.Serializable // Adicione este import
+import kotlinx.serialization.Serializable
 
-/**
- * Representa a configuração do usuário
- */
-@Serializable // Adicione esta anotação
+@Serializable
 data class Config(
     val name: String = "",
     val email: String = "",
